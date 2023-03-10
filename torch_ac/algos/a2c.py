@@ -11,6 +11,7 @@ class A2CAlgo(BaseAlgo):
                  entropy_coef=0.01, value_loss_coef=0.5, max_grad_norm=0.5, recurrence=4,
                  rmsprop_alpha=0.99, rmsprop_eps=1e-8, preprocess_obss=None, reshape_reward=None):
         print('change here')
+        print('change here again')
         num_frames_per_proc = num_frames_per_proc or 8
 
         super().__init__(envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
