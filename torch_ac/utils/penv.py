@@ -10,6 +10,7 @@ def worker(conn, env):
         if cmd == "step":
             obs, reward, terminated, truncated, info = env.step(data)
             if terminated or truncated:
+                #print('yes restarted')
                 obs, _ = env.reset()
             conn.send((obs, reward, terminated, truncated, info))
         elif cmd == "reset":
@@ -48,7 +49,9 @@ class ParallelEnv(gym.Env):
             local.send(("step", action))
         obs, reward, terminated, truncated, info = self.envs[0].step(actions[0])
         if terminated or truncated:
+            #print('obs before reset',obs)
             obs, _ = self.envs[0].reset()
+            #print('yup reset')
         results = zip(*[(obs, reward, terminated, truncated, info)] + [local.recv() for local in self.locals])
         return results
 

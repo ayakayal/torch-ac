@@ -1,116 +1,29 @@
-from abc import ABC, abstractmethod
+
 import torch
+import torch.nn.functional as F
 
 from torch_ac.format import default_preprocess_obss
 from torch_ac.utils import DictList, ParallelEnv
+import numpy as np
 
 
-class BaseAlgo(ABC):
-    """The base class for RL algorithms."""
+from torch_ac.algos import A2CAlgo
 
-    def __init__(self, envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
-                 value_loss_coef, max_grad_norm, recurrence, preprocess_obss, reshape_reward):
-        """
-        Initializes a `BaseAlgo` instance.
 
-        Parameters:
-        ----------
-        envs : list
-            a list of environments that will be run in parallel
-        acmodel : torch.Module
-            the model
-        num_frames_per_proc : int
-            the number of frames collected by every process for an update
-        discount : float
-            the discount for future rewards
-        lr : float
-            the learning rate for optimizers
-        gae_lambda : float
-            the lambda coefficient in the GAE formula
-            ([Schulman et al., 2015](https://arxiv.org/abs/1506.02438))
-        entropy_coef : float
-            the weight of the entropy cost in the final objective
-        value_loss_coef : float
-            the weight of the value loss in the final objective
-        max_grad_norm : float
-            gradient will be clipped to be at most this value
-        recurrence : int
-            the number of steps the gradient is propagated back in time
-        preprocess_obss : function
-            a function that takes observations returned by the environment
-            and converts them into the format that the model can handle
-        reshape_reward : function
-            a function that shapes the reward, takes an
-            (observation, action, reward, done) tuple as an input
-        """
-
-        # Store parameters
-
-        self.env = ParallelEnv(envs)
-        self.acmodel = acmodel
-        self.device = device
-        self.num_frames_per_proc = num_frames_per_proc
-        #print("self.num_frames_per_proc",num_frames_per_proc)
-        self.discount = discount
-        self.lr = lr
-        self.gae_lambda = gae_lambda
-        self.entropy_coef = entropy_coef
-        self.value_loss_coef = value_loss_coef
-       
-        self.max_grad_norm = max_grad_norm
-        self.recurrence = recurrence
-        self.preprocess_obss = preprocess_obss or default_preprocess_obss
-        self.reshape_reward = reshape_reward
-
-        # Control parameters
-
-        assert self.acmodel.recurrent or self.recurrence == 1
-        assert self.num_frames_per_proc % self.recurrence == 0
-
-        # Configure acmodel
-
-        self.acmodel.to(self.device)
-        self.acmodel.train()
-
-        # Store helpers values
-
-        self.num_procs = len(envs)
-        self.num_frames = self.num_frames_per_proc * self.num_procs
-       
-        # Initialize experience values
-
-        shape = (self.num_frames_per_proc, self.num_procs)
-        #print("shape* ",*shape)
-        #print("shape[0]",shape[0])
-
-        self.obs = self.env.reset()
-        self.temp=self.obs
-        #print('on reset',self.obs)
-        ##print('hi',self.obs[1]['image'].all()==self.obs[2]['image'].all())
-        self.obss = [None] * (shape[0])
-        if self.acmodel.recurrent:
-            self.memory = torch.zeros(shape[1], self.acmodel.memory_size, device=self.device)
-            self.memories = torch.zeros(*shape, self.acmodel.memory_size, device=self.device)
-        self.mask = torch.ones(shape[1], device=self.device)
-        self.masks = torch.zeros(*shape, device=self.device)
-        self.actions = torch.zeros(*shape, device=self.device, dtype=torch.int)
-        #print("self.actions",self.actions)
-        self.values = torch.zeros(*shape, device=self.device)
-        self.rewards = torch.zeros(*shape, device=self.device)
-        self.advantages = torch.zeros(*shape, device=self.device)
-        self.log_probs = torch.zeros(*shape, device=self.device)
-
-        # Initialize log values
-
-        self.log_episode_return = torch.zeros(self.num_procs, device=self.device)
-        self.log_episode_reshaped_return = torch.zeros(self.num_procs, device=self.device)
-        self.log_episode_num_frames = torch.zeros(self.num_procs, device=self.device)
-
-        self.log_done_counter = 0
-        self.log_return = [0] * self.num_procs
-        self.log_reshaped_return = [0] * self.num_procs
-        self.log_num_frames = [0] * self.num_procs
-
+class A2CAlgoEntropy(A2CAlgo):
+    def __init__(self, envs, acmodel, device=None, num_frames_per_proc=None, discount=0.99, lr=0.01, gae_lambda=0.95,
+                 entropy_coef=0.01, value_loss_coef=0.5, max_grad_norm=0.5, recurrence=4,
+                 rmsprop_alpha=0.99, rmsprop_eps=1e-8, preprocess_obss=None, entropy_ir_coeff=0.01, reshape_reward=None):
+        
+        
+        #print('self.entropy_ir_coeff',self.entropy_ir_coeff)
+        num_frames_per_proc = num_frames_per_proc or 8
+        #print('num_frames_per_proc',num_frames_per_proc)
+        #print('recurrence',recurrence)
+        super().__init__(envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda,
+                 entropy_coef, value_loss_coef, max_grad_norm, recurrence,
+                 rmsprop_alpha, rmsprop_eps, preprocess_obss, reshape_reward)
+        self.entropy_ir_coeff=entropy_ir_coeff
     def collect_experiences(self):
         """Collects rollouts and computes advantages.
 
@@ -131,8 +44,9 @@ class BaseAlgo(ABC):
             Useful stats about the training process, including the average
             reward, policy loss, value loss, etc.
         """
-        #print('ac model recurrence',self.recurrence)
-        
+        shape = (self.num_frames_per_proc, self.num_procs)
+        self.intrinsic_rewards=torch.zeros(*shape, device=self.device)
+        self.total_rewards= torch.zeros(*shape, device=self.device)
         for i in range(self.num_frames_per_proc):
             # Do one agent-environment interaction
             preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
@@ -141,25 +55,22 @@ class BaseAlgo(ABC):
                     dist, value, memory = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
                 else:
                     dist, value = self.acmodel(preprocessed_obs)
+           
+            entropy = dist.entropy().detach() #I added detach here
+          
             action = dist.sample()
-            #('action',action)
+            #print('action',action)
             obs, reward, terminated, truncated, _ = self.env.step(action.cpu().numpy())
             #print('the reward is', reward)
             done = tuple(a | b for a, b in zip(terminated, truncated))
-            # if done:
-            #     print('done aya')
-            #     print('the observation is: ',obs)
-            #     print('same as initial obs', self.temp)
-            
+            #print('hi done',done)
             # Update experiences values
 
             self.obss[i] = self.obs
             self.obs = obs
             if self.acmodel.recurrent:
-                #print('yes')
                 self.memories[i] = self.memory
                 self.memory = memory
-                #print('mem',memory)
             self.masks[i] = self.mask  
             self.mask = 1 - torch.tensor(done, device=self.device, dtype=torch.float)
             self.actions[i] = action
@@ -173,6 +84,9 @@ class BaseAlgo(ABC):
             else:
                 self.rewards[i] = torch.tensor(reward, device=self.device)
                 ##print('self.rewards[i]',self.rewards[i])
+            self.intrinsic_rewards[i]= torch.tensor(self.entropy_ir_coeff*entropy)
+            #print('self.intrinsic_rewards[i]',self.intrinsic_rewards[i])   
+            self.total_rewards[i]= self.intrinsic_rewards[i] + self.rewards[i] 
             self.log_probs[i] = dist.log_prob(action)
 
             # Update log values
@@ -215,7 +129,7 @@ class BaseAlgo(ABC):
             next_advantage = self.advantages[i+1] if i < self.num_frames_per_proc - 1 else 0
             #print('next_advantages',next_advantage)
 
-            delta = self.rewards[i] + self.discount * next_value * next_mask - self.values[i]
+            delta = self.total_rewards[i] + self.discount * next_value * next_mask - self.values[i]
             #print('delta',delta)
             self.advantages[i] = delta + self.discount * self.gae_lambda * next_advantage * next_mask
             #print("self.advantages[i]",self.advantages[i])
@@ -265,7 +179,7 @@ class BaseAlgo(ABC):
             "num_frames": self.num_frames
         }
         #print("self.log_return[-keep:]",self.log_return[-keep:])
-        #print('logs are',logs)
+
         self.log_done_counter = 0
         self.log_return = self.log_return[-self.num_procs:]
         #print('self.log_return',self.log_return)
@@ -274,6 +188,8 @@ class BaseAlgo(ABC):
 
         return exps, logs
 
-    @abstractmethod
-    def update_parameters(self):
-        pass
+        
+        
+        
+
+    

@@ -9,11 +9,11 @@ import numpy as np
 import sys
 sys.path.append("/home/rmapkay/rl-starter-files") 
 #print('hello',sys.path)
-from curiosity_models import MinigridForwardDynamicsNet, MinigridStateEmbeddingNet
+from curiosity_models import MinigridForwardDynamicsNet, MinigridStateEmbeddingNet, MinigridInverseDynamicsNet
 
 from torch_ac.algos import A2CAlgo
 
-class A2CAlgoICM(A2CAlgo):
+class A2CAlgoICM_inverse(A2CAlgo):
     def __init__(self, envs, acmodel, device=None, num_frames_per_proc=None, discount=0.99, lr=0.01, gae_lambda=0.95,
                  entropy_coef=0.01, value_loss_coef=0.5, max_grad_norm=0.5, recurrence=4,
                  rmsprop_alpha=0.99, rmsprop_eps=1e-8, preprocess_obss=None, ir_coeff=0.001, reshape_reward=None):
@@ -27,8 +27,8 @@ class A2CAlgoICM(A2CAlgo):
                  rmsprop_alpha, rmsprop_eps, preprocess_obss, reshape_reward)
         
         self.intrinsic_reward_coeff = ir_coeff
-        #self.forward_dynamics_loss_coef= 0.2
         self.prediction_scale=10
+        self.forward_dynamics_loss_coef= 0.2
         shape = (self.num_frames_per_proc, self.num_procs)
         self.total_rewards= torch.zeros(*shape, device=self.device)
 #initialize intrinsic rewards
@@ -38,11 +38,11 @@ class A2CAlgoICM(A2CAlgo):
         #if you put.cuda to your network then the weights will be on GPU
         self.embedding_network=  MinigridStateEmbeddingNet().cuda() 
         self.forward_dynamics_model= MinigridForwardDynamicsNet(envs[0].action_space).cuda()
+        self.inverse_dynamics_model= MinigridInverseDynamicsNet(envs[0].action_space).cuda()
 
-        
         self.forward_dynamics_optimizer = torch.optim.RMSprop(self.forward_dynamics_model.parameters(), lr, alpha=rmsprop_alpha, eps=rmsprop_eps)
-        #self.state_embedding_optimizer = torch.optim.RMSprop(self.embedding_network.parameters(), lr, alpha=rmsprop_alpha, eps=rmsprop_eps)
-
+        self.state_embedding_optimizer = torch.optim.RMSprop(self.embedding_network.parameters(), lr, alpha=rmsprop_alpha, eps=rmsprop_eps)
+        self.inverse_dynamics_optimizer= torch.optim.RMSprop(self.inverse_dynamics_model.parameters(), lr, alpha=rmsprop_alpha, eps=rmsprop_eps)
   
     def collect_experiences(self):
         """Collects rollouts and computes advantages.
@@ -295,7 +295,7 @@ class A2CAlgoICM(A2CAlgo):
 
             if self.acmodel.recurrent:
                 dist, value, memory = self.acmodel(sb.obs, memory * sb.mask)
-                #print('value',value)
+                #print('dist',dist)
                 #print('memory',memory)
             else:
                 dist, value = self.acmodel(sb.obs)
@@ -310,20 +310,26 @@ class A2CAlgoICM(A2CAlgo):
 
             #Added this part for feed forward training of forward dynamics 
             
-            state_emb = self.embedding_network(sb.obs) #i removed .detach
-            #print('state_emb grad', state_emb.requires_grad)
+            state_emb = self.embedding_network(sb.obs) 
             ##print('state emb', state_emb.shape)
         #next_state_emb = self.embedding_network(exps.obs[1:])
-            next_state_emb = self.embedding_network(sb.obs_to_embed) #i removed .detach
-            #print('next state_emb grad', next_state_emb.requires_grad)
+            next_state_emb = self.embedding_network(sb.obs_to_embed) 
            ##print('next state emb', next_state_emb.shape) 
-            #print('action grad',sb.action.requires_grad)
+        
             pred_next_state_emb= self.forward_dynamics_model(state_emb,sb.action)
             #print('halu',state_emb.requires_grad) 
             forward_dynamics_loss= ((torch.norm(pred_next_state_emb - next_state_emb, dim=1, p=2).pow(2)).mean())*0.5
             ##print('forward dynamics loss',forward_dynamics_loss)
 
-            loss = policy_loss - self.entropy_coef * entropy + self.value_loss_coef * value_loss+  self.prediction_scale *forward_dynamics_loss
+            #inverse dynamics loss:
+            pred_dist= self.inverse_dynamics_model(state_emb,next_state_emb)
+            #print('pred_dist',pred_dist)
+            #print('sb.action',sb.action)
+            inverse_dynamics_loss= -(pred_dist.log_prob(sb.action)).mean()
+            #print('invserse dynamics loss',inverse_dynamics_loss)
+            #logits_predicted_actions=F.log_softmax(predicted_actions, dim=1)
+            #print('logits',logits_predicted_actions)
+            loss = policy_loss - self.entropy_coef * entropy + self.value_loss_coef * value_loss+  self.prediction_scale*(self.forward_dynamics_loss_coef *forward_dynamics_loss+ (1-self.forward_dynamics_loss_coef)*inverse_dynamics_loss)
             #print('loss',loss)
             # Update batch values
 
@@ -347,22 +353,26 @@ class A2CAlgoICM(A2CAlgo):
 
         self.optimizer.zero_grad()
         self.forward_dynamics_optimizer.zero_grad()
+        self.state_embedding_optimizer.zero_grad()
+        self.inverse_dynamics_optimizer.zero_grad()
         #torch.autograd.set_detect_anomaly(True)
         #update_loss = update_loss #I added this I had .detach here
         # with torch.no_grad():
         #     update_loss.backward(retain_graph=True)
-        update_loss.backward(retain_graph=True)
+        update_loss.backward()
         #update_loss2.backward()
         update_grad_norm = sum(p.grad.data.norm(2) ** 2 for p in self.acmodel.parameters()) ** 0.5
+
         torch.nn.utils.clip_grad_norm_(self.acmodel.parameters(), self.max_grad_norm)
         torch.nn.utils.clip_grad_norm_(self.forward_dynamics_model.parameters(),self.max_grad_norm)
+        torch.nn.utils.clip_grad_norm_(self.inverse_dynamics_model.parameters(),self.max_grad_norm)
+        torch.nn.utils.clip_grad_norm_(self.embedding_network.parameters(),self.max_grad_norm)
 
         self.optimizer.step()
+        self.state_embedding_optimizer.step()
         self.forward_dynamics_optimizer.step()
-        # for param in self.embedding_network.parameters():
-        #       print(param)
+        self.inverse_dynamics_optimizer.step()
         
-        #self.state_embedding_optimizer.step()
 
         # Log some values
 
@@ -375,5 +385,6 @@ class A2CAlgoICM(A2CAlgo):
         }
 
         return logs
+    
     def pass_models_parameters(self):
-        return self.embedding_network,self.forward_dynamics_model,self.forward_dynamics_optimizer
+        return self.embedding_network,self.forward_dynamics_model,self.inverse_dynamics_model,self.state_embedding_optimizer,self.forward_dynamics_optimizer,self.inverse_dynamics_optimizer

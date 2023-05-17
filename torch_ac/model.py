@@ -13,6 +13,7 @@ class ACModel:
     def forward(self, obs):
         pass
 
+
 class RecurrentACModel(ACModel):
     recurrent = True
 
