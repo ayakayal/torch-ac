@@ -1,164 +1,45 @@
-from abc import ABC, abstractmethod
 import torch
+import torch.nn.functional as F
 
 from torch_ac.format import default_preprocess_obss
-from torch_ac.utils import DictList, ParallelEnv, SingletonParallelEnv
+from torch_ac.utils import DictList, ParallelEnv
 import numpy as np
+from torch_ac.algos import PPOAlgo
+from copy import deepcopy
+from collections import deque
+from statistics import mean
+from icm_models_alain import ICMModule, EmbeddingNetwork_RIDE, InverseDynamicsNetwork_RIDE, ForwardDynamicsNetwork_RIDE
+def default_preprocess_obss(obss, device=None):
+    return torch.tensor(obss, device=device)
 
-
-class BaseAlgo(ABC):
-    """The base class for RL algorithms."""
-
-    def __init__(self, envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
-                 value_loss_coef, max_grad_norm, recurrence, preprocess_obss, reshape_reward, singleton_env):
-        """
-        Initializes a `BaseAlgo` instance.
-
-        Parameters:
-        ----------
-        envs : list
-            a list of environments that will be run in parallel
-        acmodel : torch.Module
-            the model
-        num_frames_per_proc : int
-            the number of frames collected by every process for an update
-        discount : float
-            the discount for future rewards
-        lr : float
-            the learning rate for optimizers
-        gae_lambda : float
-            the lambda coefficient in the GAE formula
-            ([Schulman et al., 2015](https://arxiv.org/abs/1506.02438))
-        entropy_coef : float
-            the weight of the entropy cost in the final objective
-        value_loss_coef : float
-            the weight of the value loss in the final objective
-        max_grad_norm : float
-            gradient will be clipped to be at most this value
-        recurrence : int
-            the number of steps the gradient is propagated back in time
-        preprocess_obss : function
-            a function that takes observations returned by the environment
-            and converts them into the format that the model can handle
-        reshape_reward : function
-            a function that shapes the reward, takes an
-            (observation, action, reward, done) tuple as an input
-        """
-        self.singleton_env=singleton_env
-        #self.state_visitation_pos=dict()
-        self.state_visitation_pos= {(x, y): 0 for x in range(19) for y in range(19)}
-        #print('self.state_visitation_pos',self.state_visitation_pos)
-        self.ir_dict={(x, y): 0 for x in range(19) for y in range(19)}
-        print('sing base',self.singleton_env)
-        if self.singleton_env == 'False':
-            print('using procedurally generated env')
-            self.env = ParallelEnv(envs)
-        else:
-            print("Using singleton env")
-            self.env = SingletonParallelEnv(envs)
+class PPOAlgoICMAlain(PPOAlgo):
+    def __init__(self, envs, acmodel, device=None, num_frames_per_proc=None, discount=0.99, lr=0.001, gae_lambda=0.95,
+                 entropy_coef=0.01, value_loss_coef=0.5, max_grad_norm=0.5, recurrence=4,
+                 adam_eps=1e-8, clip_eps=0.2, epochs=4, batch_size=256,singleton_env=False, preprocess_obss=None,intrinsic_reward_coeff=0.0001, 
+                 reshape_reward=None): 
+      
+        super().__init__(envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda,
+                 entropy_coef, value_loss_coef, max_grad_norm, recurrence,
+                 adam_eps, clip_eps, epochs, batch_size,singleton_env, preprocess_obss,
+                 reshape_reward)
         
-        self.acmodel = acmodel
-        self.device = device
-        self.num_frames_per_proc = num_frames_per_proc
-        #print("self.num_frames_per_proc",num_frames_per_proc)
-        self.discount = discount
-        self.lr = lr
-        self.gae_lambda = gae_lambda
-        self.entropy_coef = entropy_coef
-        self.value_loss_coef = value_loss_coef
-       
-        self.max_grad_norm = max_grad_norm
-        self.recurrence = recurrence
-        self.preprocess_obss = preprocess_obss or default_preprocess_obss
-        self.reshape_reward = reshape_reward
-
-        # Control parameters
-
-        assert self.acmodel.recurrent or self.recurrence == 1
-        assert self.num_frames_per_proc % self.recurrence == 0
-
-        # Configure acmodel
-
-        self.acmodel.to(self.device)
-        self.acmodel.train()
-
-        # Store helpers values
-
-        self.num_procs = len(envs)
-        self.num_frames = self.num_frames_per_proc * self.num_procs
-       
-        # Initialize experience values
-
+        self.intrinsic_reward_coeff =intrinsic_reward_coeff
+        self.num_actions=envs[0].action_space.n
+        self.im_module = ICMModule(emb_network = EmbeddingNetwork_RIDE(),
+                                           inv_network = InverseDynamicsNetwork_RIDE(num_actions=self.num_actions, device=self.device),
+                                           forw_network = ForwardDynamicsNetwork_RIDE(num_actions=self.num_actions, device=self.device),
+                                           device = device)
         shape = (self.num_frames_per_proc, self.num_procs)
-        #print("shape* ",*shape)
-        #print("shape[0]",shape[0])
+        self.rewards_int = torch.zeros(*shape, device=self.device)
+        self.rewards_total = torch.zeros(*shape, device=self.device)
 
-        self.obs = self.env.reset()
-        self.temp=self.obs
-        #print('on reset',self.obs)
-        ##print('hi',self.obs[1]['image'].all()==self.obs[2]['image'].all())
-        self.obss = [None] * (shape[0])
-        if self.acmodel.recurrent:
-            self.memory = torch.zeros(shape[1], self.acmodel.memory_size, device=self.device)
-            self.memories = torch.zeros(*shape, self.acmodel.memory_size, device=self.device)
-        self.mask = torch.ones(shape[1], device=self.device)
-        self.masks = torch.zeros(*shape, device=self.device)
-        self.actions = torch.zeros(*shape, device=self.device, dtype=torch.int)
-        #print("self.actions",self.actions)
-        self.values = torch.zeros(*shape, device=self.device)
-        self.rewards = torch.zeros(*shape, device=self.device)
-        self.advantages = torch.zeros(*shape, device=self.device)
-        self.log_probs = torch.zeros(*shape, device=self.device)
-
-        # Initialize log values
-
-        self.log_episode_return = torch.zeros(self.num_procs, device=self.device)
-        self.log_episode_reshaped_return = torch.zeros(self.num_procs, device=self.device)
-        self.log_episode_num_frames = torch.zeros(self.num_procs, device=self.device)
-
-        self.log_done_counter = 0
-        self.log_return = [0] * self.num_procs
-        self.log_reshaped_return = [0] * self.num_procs
-        self.log_num_frames = [0] * self.num_procs
-        #store the dictionary count
-        self.train_state_count=dict()
-
-        #add this for frames
-        self.frames=[] #for video frames concatination
-
-        self.total_frames=0 #to count frames over the whole training
-        self.found_reward= 0
-        self.saved_frame_first_reward=0 #this is the frame at which the goal is reached for the first time
-        self.saved_frame_second_reward=0
-        self.saved_frame_third_reward=0
-        self.vizualise_video= False
-        self.intrinsic_reward_per_frame = 0
-        #self.ir_dict=dict()
+        #add these for intrinsic rewards
+        self.log_episode_return_int = torch.zeros(self.num_procs, device=self.device)
+        self.log_return_int =  [0] * self.num_procs
         
     def collect_experiences(self):
-        """Collects rollouts and computes advantages.
-
-        Runs several environments concurrently. The next actions are computed
-        in a batch mode for all environments at the same time. The rollouts
-        and advantages from all environments are concatenated together.
-
-        Returns
-        -------
-        exps : DictList
-            Contains actions, rewards, advantages etc as attributes.
-            Each attribute, e.g. `exps.reward` has a shape
-            (self.num_frames_per_proc * num_envs, ...). k-th block
-            of consecutive `self.num_frames_per_proc` frames contains
-            data obtained from the k-th environment. Be careful not to mix
-            data from different environments!
-        logs : dict
-            Useful stats about the training process, including the average
-            reward, policy loss, value loss, etc.
-        """
-        #print('ac model recurrence',self.recurrence)
-        
         for i in range(self.num_frames_per_proc):
-            self.total_frames+=self.num_procs #every step increment by 16 processes in parallel
+            self.total_frames+=self.num_procs
             # Do one agent-environment interaction
             preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
             with torch.no_grad():
@@ -168,18 +49,15 @@ class BaseAlgo(ABC):
                     dist, value = self.acmodel(preprocessed_obs)
             action = dist.sample()
             #('action',action)
-            #for visualization
             if self.vizualise_video==True:
                 self.frames.append(np.moveaxis(self.env.envs[0].get_frame(), 2, 0))
            
             obs, reward, terminated, truncated, agent_loc, _ = self.env.step(action.cpu().numpy())
-        
             for agent_state in agent_loc:
                 if agent_state in self.state_visitation_pos.keys():
                     self.state_visitation_pos[agent_state] += 1
                 else:
                     self.state_visitation_pos[agent_state] = 1
-          
             for r in reward:
                 if r!=0 and self.found_reward==0:
                     self.saved_frame_first_reward=self.total_frames
@@ -193,19 +71,8 @@ class BaseAlgo(ABC):
                     self.saved_frame_third_reward=self.total_frames
                     self.found_reward=3
                     continue
-
-           
-            
             #print('the reward is', reward)
             done = tuple(a | b for a, b in zip(terminated, truncated))
-            # if done:
-            #     print('done aya')
-            #     print('the observation is: ',obs)
-            #     print('same as initial obs', self.temp)
-            
-            # Update experiences values
-
-            #to store the state count
             for p in range(self.num_procs):
                 obs_tuple=tuple( obs[p]['image'].reshape(-1).tolist())
                 #print('obs tuple',len(obs_tuple))
@@ -213,6 +80,12 @@ class BaseAlgo(ABC):
                     self.train_state_count[obs_tuple]+= 1
                 else:
                     self.train_state_count[obs_tuple]=1
+            # if done:
+            #     print('done aya')
+            #     print('the observation is: ',obs)
+            #     print('same as initial obs', self.temp)
+            
+            # Update experiences values
 
             self.obss[i] = self.obs
             self.obs = obs
@@ -235,35 +108,80 @@ class BaseAlgo(ABC):
                 self.rewards[i] = torch.tensor(reward, device=self.device)
                 ##print('self.rewards[i]',self.rewards[i])
             self.log_probs[i] = dist.log_prob(action)
+            input_current_obs = preprocessed_obs
+            input_next_obs = self.preprocess_obss(self.obs, device=self.device) # contains next_observations
 
-            # Update log values
+            # FOR COMPUTING INTRINSIC REWARD, THE REQUIRED SHAPE IS JUST A UNIT -- i.e image of [7,7,3]; action of [1] (it is calculated one by one)
+            # FOR UPDATING COUNTS (done IN BATCH for efficiency), the shape requires to have the batch-- i.e image of [batch,7,7,3]; action of [batch,1]
 
+           
+            rewards_int = [self.im_module.compute_intrinsic_reward(obs=ob,next_obs=nobs,actions=act) \
+                                        for ob,nobs,act in zip(input_current_obs.image, input_next_obs.image, action)]
+
+            self.rewards_int[i] = rewards_int_torch = torch.tensor(rewards_int,device=self.device,dtype=torch.float)
+           
+            #print('self.rewards_int',self.rewards_int[i])
+            temp_rewards_int=self.intrinsic_reward_coeff*self.rewards_int[i]
+            if self.singleton_env != 'False':
+                # print('yes singleton intrinsic rewards')
+                
+                for idx in range(len( temp_rewards_int)):
+                    #print(self.intrinsic_rewards[i])
+                    if agent_loc[idx] in self.ir_dict.keys():
+                        #print(self.intrinsic_rewards[i][idx])
+                        self.ir_dict[agent_loc[idx]] +=  temp_rewards_int[idx].item()
+                    else:
+                        self.ir_dict[agent_loc[idx]] =  temp_rewards_int[idx].item()
+            #print('self.ir_dict',self.ir_dict)
+            self.intrinsic_reward_per_frame=torch.mean(self.intrinsic_reward_coeff*self.rewards_int[i])
+            #print('self.intrinsic_reward_per_frame',self.intrinsic_reward_per_frame)
             self.log_episode_return += torch.tensor(reward, device=self.device, dtype=torch.float)
+            self.log_episode_return_int += rewards_int_torch
             #print(" self.log_episode_return", self.log_episode_return)
             self.log_episode_reshaped_return += self.rewards[i]
             self.log_episode_num_frames += torch.ones(self.num_procs, device=self.device)
-            #print(" self.log_episode_num_frames", self.log_episode_num_frames)
-
             for i, done_ in enumerate(done): #for any done episode in any process we append it to log_return
                 if done_:
                     #print("i",i)
                     #print('done',done_)
                     self.log_done_counter += 1
                     self.log_return.append(self.log_episode_return[i].item())
+                    self.log_return_int.append(self.log_episode_return_int[i].item())
         
                     #print(" self.log_return", self.log_return)
                     self.log_reshaped_return.append(self.log_episode_reshaped_return[i].item())
                     self.log_num_frames.append(self.log_episode_num_frames[i].item())
 
-                    #save the first time you see the reward
-                    
                     
 
             self.log_episode_return *= self.mask #to reset when the episode is done
             self.log_episode_reshaped_return *= self.mask
             self.log_episode_num_frames *= self.mask
+            self.log_episode_return_int *= self.mask
 
-        # Add advantage and return to experiences
+
+        shape_im = (self.num_frames_per_proc,self.num_procs, 7,7,3) # preprocess batch observations (num_steps*num_instances, 7 x 7 x 3)
+        input_obss = torch.zeros(*shape_im,device=self.device)
+        input_nobss = torch.zeros(*shape_im,device=self.device)
+
+        # generate next_states (same as self.obss + an additional next_state of al the penvs)
+        nobss = deepcopy(self.obss)
+        nobss = nobss[1:] # pop first element and move left
+        nobss.append(self.obs) # add at the last position the next_states
+
+        for num_frame,(mult_obs,mult_nobs) in enumerate(zip(self.obss,nobss)): # len(self.obss) ==> num_frames_per_proc == number_of_step
+
+            for num_process,(obss,nobss) in enumerate(zip(mult_obs,mult_nobs)):
+                o = torch.tensor(obss['image'], device=self.device)
+                no = torch.tensor(nobss['image'], device=self.device)
+                input_obss[num_frame,num_process].copy_(o)
+                input_nobss[num_frame,num_process].copy_(no)
+
+        # 1.2. reshape to have [num_frames*num_procs, 7, 7, 3]
+        input_obss = input_obss.view(self.num_frames_per_proc*self.num_procs,7,7,3)
+        input_nobss = input_nobss.view(self.num_frames_per_proc*self.num_procs,7,7,3)
+        input_actions = self.actions.view(self.num_frames_per_proc*self.num_procs,-1)
+        forward_dynamics_loss,inverse_dynamics_loss=self.im_module.update(obs=input_obss,next_obs=input_nobss,actions=input_actions)
 
         preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
         with torch.no_grad():
@@ -271,6 +189,10 @@ class BaseAlgo(ABC):
                 _, next_value, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
             else:
                 _, next_value = self.acmodel(preprocessed_obs)
+
+        self.rewards_total = self.rewards + self.intrinsic_reward_coeff*self.rewards_int
+        self.rewards_total /= (1+self.intrinsic_reward_coeff)
+
 
         for i in reversed(range(self.num_frames_per_proc)):
             #print('i',i)
@@ -280,20 +202,12 @@ class BaseAlgo(ABC):
             next_advantage = self.advantages[i+1] if i < self.num_frames_per_proc - 1 else 0
             #print('next_advantages',next_advantage)
 
-            delta = self.rewards[i] + self.discount * next_value * next_mask - self.values[i]
-            #print('delta',delta)
+            delta = self.rewards_total[i] + self.discount * next_value * next_mask - self.values[i]
+            #print('delta',delta.shape)
+            #print('khara',self.discount * self.gae_lambda * next_advantage * next_mask)
             self.advantages[i] = delta + self.discount * self.gae_lambda * next_advantage * next_mask
-            #print("self.advantages[i]",self.advantages[i])
-            #print("self.gae",self.gae_lambda)
-
-        # Define experiences:
-        #   the whole experience is the concatenation of the experience
-        #   of each process.
-        # In comments below:
-        #   - T is self.num_frames_per_proc,
-        #   - P is self.num_procs,
-        #   - D is the dimensionality.
-
+        
+       
         exps = DictList()
         exps.obs = [self.obss[i][j]
                     for j in range(self.num_procs)
@@ -322,25 +236,24 @@ class BaseAlgo(ABC):
         keep = max(self.log_done_counter, self.num_procs)
         #print("self.log_done_counter",self.log_done_counter)f
         #print("self.log_return",self.log_return)
-        #log the state coverage
         self.number_of_visited_states= len(self.train_state_count)
-        #print('number of partial obs',self.number_of_visited_states)
         #size of the grid and the possible combinations of object index, color and status
         self.state_coverage= self.number_of_visited_states #percentage of state coverage
         #self.state_coverage_position=len(self.state_visitation_pos)
-        
         non_zero_count=0
         for key, value in self.state_visitation_pos.items():
             if value != 0:
                 non_zero_count += 1
         self.state_coverage_position= non_zero_count
-        
-        
+
         logs = {
             "return_per_episode": self.log_return[-keep:], #u keep the log of the last #processes episode returns
             "reshaped_return_per_episode": self.log_reshaped_return[-keep:],
             "num_frames_per_episode": self.log_num_frames[-keep:],
             "num_frames": self.num_frames,
+            "return_int_per_episode": self.log_return_int[-keep:],
+            "forward_dynamics_loss": forward_dynamics_loss.item(),
+            "inverse_dynamics_loss": inverse_dynamics_loss.item(),
             "state_coverage": self.state_coverage,
             "frame_first_reward": self.saved_frame_first_reward,
             "frame_second_reward": self.saved_frame_second_reward,
@@ -352,15 +265,12 @@ class BaseAlgo(ABC):
             
         }
         #print("self.log_return[-keep:]",self.log_return[-keep:])
-        #print('logs are',logs)
+       
         self.log_done_counter = 0
         self.log_return = self.log_return[-self.num_procs:]
+        self.log_return_int = self.log_return_int[-self.num_procs:]
         #print('self.log_return',self.log_return)
         self.log_reshaped_return = self.log_reshaped_return[-self.num_procs:]
         self.log_num_frames = self.log_num_frames[-self.num_procs:]
 
-        return exps, logs, self.frames #self.frames for video visualization
-
-    @abstractmethod
-    def update_parameters(self):
-        pass
+        return exps, logs, self.frames

@@ -1,29 +1,24 @@
-
 import torch
 import torch.nn.functional as F
 
 from torch_ac.format import default_preprocess_obss
 from torch_ac.utils import DictList, ParallelEnv
 import numpy as np
+from torch_ac.algos import PPOAlgo
 
-
-from torch_ac.algos import A2CAlgo
-
-
-class A2CAlgoEntropy(A2CAlgo):
-    def __init__(self, envs, acmodel, device=None, num_frames_per_proc=None, discount=0.99, lr=0.01, gae_lambda=0.95,
-                 entropy_coef=0.01, value_loss_coef=0.5, max_grad_norm=0.5, recurrence=1,
-                 rmsprop_alpha=0.99, rmsprop_eps=1e-8, preprocess_obss=None, ir_coeff=0.0005, reshape_reward=None):
-        
-        
-        #print('self.entropy_ir_coeff',self.entropy_ir_coeff)
-        num_frames_per_proc = num_frames_per_proc or 8
-        #print('num_frames_per_proc',num_frames_per_proc)
-        #print('recurrence',recurrence)
+class PPOAlgoEntropy(PPOAlgo):
+    def __init__(self, envs, acmodel, device=None, num_frames_per_proc=None, discount=0.99, lr=0.001, gae_lambda=0.95,
+                 entropy_coef=0.01, value_loss_coef=0.5, max_grad_norm=0.5, recurrence=4,
+                 adam_eps=1e-8, clip_eps=0.2, epochs=4, batch_size=256,singleton_env=False, preprocess_obss=None,intrinsic_reward_coeff=0.0001, 
+                 reshape_reward=None): 
+      
         super().__init__(envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda,
                  entropy_coef, value_loss_coef, max_grad_norm, recurrence,
-                 rmsprop_alpha, rmsprop_eps, preprocess_obss, reshape_reward)
-        self.intrinsic_reward_coeff =ir_coeff
+                 adam_eps, clip_eps, epochs, batch_size,singleton_env, preprocess_obss,
+                 reshape_reward)
+        self.intrinsic_reward_coeff =intrinsic_reward_coeff
+        self.log_episode_return_int = torch.zeros(self.num_procs, device=self.device)
+        self.log_return_int =  [0] * self.num_procs
     def collect_experiences(self):
         """Collects rollouts and computes advantages.
 
@@ -48,6 +43,7 @@ class A2CAlgoEntropy(A2CAlgo):
         self.intrinsic_rewards=torch.zeros(*shape, device=self.device)
         self.total_rewards= torch.zeros(*shape, device=self.device)
         for i in range(self.num_frames_per_proc):
+            self.total_frames+=self.num_procs
             # Do one agent-environment interaction
             preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
             with torch.no_grad():
@@ -60,9 +56,40 @@ class A2CAlgoEntropy(A2CAlgo):
           
             action = dist.sample()
             #print('action',action)
-            obs, reward, terminated, truncated, _ = self.env.step(action.cpu().numpy())
+            if self.vizualise_video==True:
+                self.frames.append(np.moveaxis(self.env.envs[0].get_frame(), 2, 0))
+           
+            obs, reward, terminated, truncated, agent_loc, _ = self.env.step(action.cpu().numpy())
+            for agent_state in agent_loc:
+                if agent_state in self.state_visitation_pos.keys():
+                    self.state_visitation_pos[agent_state] += 1
+                else:
+                    self.state_visitation_pos[agent_state] = 1
+            for r in reward:
+                if r!=0 and self.found_reward==0:
+                    self.saved_frame_first_reward=self.total_frames
+                    self.found_reward=1
+                    continue
+                if r!=0 and self.found_reward==1:
+                    self.saved_frame_second_reward=self.total_frames
+                    self.found_reward=2
+                    continue
+                if r!=0 and self.found_reward==2:
+                    self.saved_frame_third_reward=self.total_frames
+                    self.found_reward=3
+                    continue
+
+            #obs, reward, terminated, truncated, _ = self.env.step(action.cpu().numpy())
             #print('the reward is', reward)
             done = tuple(a | b for a, b in zip(terminated, truncated))
+
+            for p in range(self.num_procs):
+                obs_tuple=tuple( obs[p]['image'].reshape(-1).tolist())
+                #print('obs tuple',len(obs_tuple))
+                if obs_tuple in self.train_state_count:
+                    self.train_state_count[obs_tuple]+= 1
+                else:
+                    self.train_state_count[obs_tuple]=1
             #print('hi done',done)
             # Update experiences values
 
@@ -84,14 +111,31 @@ class A2CAlgoEntropy(A2CAlgo):
             else:
                 self.rewards[i] = torch.tensor(reward, device=self.device)
                 ##print('self.rewards[i]',self.rewards[i])
-            self.intrinsic_rewards[i]= torch.tensor(self.intrinsic_reward_coeff *entropy)
+            #self.intrinsic_rewards[i]= torch.tensor(self.intrinsic_reward_coeff *entropy)
+            self.intrinsic_rewards[i]= self.intrinsic_reward_coeff *entropy.clone().detach()
+            self.intrinsic_reward_per_frame=torch.mean(self.intrinsic_rewards[i])
             #print('self.intrinsic_rewards[i]',self.intrinsic_rewards[i])   
             self.total_rewards[i]= self.intrinsic_rewards[i] + self.rewards[i] 
+            #I added this recently
+            self.total_rewards[i] /= (1+self.intrinsic_reward_coeff)
+            if self.singleton_env != 'False':
+                # print('yes singleton intrinsic rewards')
+                
+                for idx in range(len(self.intrinsic_rewards[i])):
+                    #print(self.intrinsic_rewards[i])
+                    if agent_loc[idx] in self.ir_dict.keys():
+                        #print(self.intrinsic_rewards[i][idx])
+                        self.ir_dict[agent_loc[idx]] += self.intrinsic_rewards[i][idx].item()
+                    else:
+                        self.ir_dict[agent_loc[idx]] = self.intrinsic_rewards[i][idx].item()
+                    #print('dict',self.ir_dict)
+
             self.log_probs[i] = dist.log_prob(action)
 
             # Update log values
 
             self.log_episode_return += torch.tensor(reward, device=self.device, dtype=torch.float)
+            self.log_episode_return_int += self.intrinsic_rewards[i].clone().detach()
             #print(" self.log_episode_return", self.log_episode_return)
             self.log_episode_reshaped_return += self.rewards[i]
             self.log_episode_num_frames += torch.ones(self.num_procs, device=self.device)
@@ -107,10 +151,14 @@ class A2CAlgoEntropy(A2CAlgo):
                     #print(" self.log_return", self.log_return)
                     self.log_reshaped_return.append(self.log_episode_reshaped_return[i].item())
                     self.log_num_frames.append(self.log_episode_num_frames[i].item())
+                    self.log_return_int.append(self.log_episode_return_int[i].item())
+
+                    
 
             self.log_episode_return *= self.mask #to reset when the episode is done
             self.log_episode_reshaped_return *= self.mask
             self.log_episode_num_frames *= self.mask
+            self.log_episode_return_int *= self.mask
 
         # Add advantage and return to experiences
 
@@ -171,22 +219,41 @@ class A2CAlgoEntropy(A2CAlgo):
         keep = max(self.log_done_counter, self.num_procs)
         #print("self.log_done_counter",self.log_done_counter)f
         #print("self.log_return",self.log_return)
+        self.number_of_visited_states= len(self.train_state_count)
+        self.state_coverage= self.number_of_visited_states
+        #self.state_coverage_position=len(self.state_visitation_pos)
+        non_zero_count=0
+        for key, value in self.state_visitation_pos.items():
+            if value != 0:
+                non_zero_count += 1
+        self.state_coverage_position= non_zero_count
+
 
         logs = {
             "return_per_episode": self.log_return[-keep:], #u keep the log of the last #processes episode returns
             "reshaped_return_per_episode": self.log_reshaped_return[-keep:],
             "num_frames_per_episode": self.log_num_frames[-keep:],
-            "num_frames": self.num_frames
+            "num_frames": self.num_frames,
+            "return_int_per_episode": self.log_return_int[-keep:],
+            "state_coverage": self.state_coverage,
+            "frame_first_reward": self.saved_frame_first_reward,
+            "frame_second_reward": self.saved_frame_second_reward,
+            "frame_third_reward": self.saved_frame_third_reward,
+            "state_visitation_pos":self.state_visitation_pos,
+            "state_coverage_position":self.state_coverage_position,
+            "reward_int_per_frame":self.intrinsic_reward_per_frame,
+            "ir_dict":self.ir_dict
         }
         #print("self.log_return[-keep:]",self.log_return[-keep:])
 
         self.log_done_counter = 0
+        self.log_return_int = self.log_return_int[-self.num_procs:]
         self.log_return = self.log_return[-self.num_procs:]
         #print('self.log_return',self.log_return)
         self.log_reshaped_return = self.log_reshaped_return[-self.num_procs:]
         self.log_num_frames = self.log_num_frames[-self.num_procs:]
 
-        return exps, logs
+        return exps, logs, self.frames
 
         
         
